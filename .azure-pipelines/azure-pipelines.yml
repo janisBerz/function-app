@@ -1,0 +1,97 @@
+trigger:
+  - main
+
+variables:
+  # Terraform variables
+  TF_STATE_RESOURCE_GROUP: 'terraform-state-rg'
+  TF_STATE_STORAGE_ACCOUNT: 'tfstate$(uniqueString(subscription().id))'
+  TF_STATE_CONTAINER: 'tfstate'
+  TF_STATE_KEY: 'function-app.tfstate'
+  TF_WORKING_DIR: '$(System.DefaultWorkingDirectory)/terraform'
+  # Function App variables
+  FUNCTION_APP_NAME: 'func-$(uniqueString(subscription().id))'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+- stage: 'Terraform'
+  jobs:
+  - job: 'TerraformProvision'
+    steps:
+    - task: AzureCLI@2
+      name: 'TerraformBackendSetup'
+      inputs:
+        azureSubscription: 'Azure-Service-Connection'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          # Create resource group for Terraform state
+          az group create --name $(TF_STATE_RESOURCE_GROUP) --location eastus
+          
+          # Create storage account for Terraform state
+          az storage account create --name $(TF_STATE_STORAGE_ACCOUNT) \
+            --resource-group $(TF_STATE_RESOURCE_GROUP) \
+            --sku Standard_LRS \
+            --encryption-services blob
+          
+          # Create blob container for Terraform state
+          az storage container create \
+            --name $(TF_STATE_CONTAINER) \
+            --account-name $(TF_STATE_STORAGE_ACCOUNT)
+
+    - task: TerraformInstaller@0
+      inputs:
+        terraformVersion: 'latest'
+
+    - task: TerraformTaskV4@4
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        workingDirectory: '$(TF_WORKING_DIR)'
+        backendServiceArm: 'Azure-Service-Connection'
+        backendAzureRmResourceGroupName: '$(TF_STATE_RESOURCE_GROUP)'
+        backendAzureRmStorageAccountName: '$(TF_STATE_STORAGE_ACCOUNT)'
+        backendAzureRmContainerName: '$(TF_STATE_CONTAINER)'
+        backendAzureRmKey: '$(TF_STATE_KEY)'
+
+    - task: TerraformTaskV4@4
+      inputs:
+        provider: 'azurerm'
+        command: 'plan'
+        workingDirectory: '$(TF_WORKING_DIR)'
+        environmentServiceNameAzureRM: 'Azure-Service-Connection'
+
+    - task: TerraformTaskV4@4
+      inputs:
+        provider: 'azurerm'
+        command: 'apply'
+        workingDirectory: '$(TF_WORKING_DIR)'
+        environmentServiceNameAzureRM: 'Azure-Service-Connection'
+
+- stage: 'Deploy'
+  dependsOn: 'Terraform'
+  jobs:
+  - job: 'DeployFunction'
+    steps:
+    - task: DotNetCoreCLI@2
+      inputs:
+        command: 'build'
+        projects: '**/*.csproj'
+        arguments: '--configuration Release'
+
+    - task: DotNetCoreCLI@2
+      inputs:
+        command: 'publish'
+        publishWebProjects: false
+        projects: '**/*.csproj'
+        arguments: '--configuration Release --output $(Build.ArtifactStagingDirectory)'
+        zipAfterPublish: true
+
+    - task: AzureFunctionApp@1
+      inputs:
+        azureSubscription: 'Azure-Service-Connection'
+        appType: 'functionApp'
+        appName: '$(FUNCTION_APP_NAME)'
+        package: '$(Build.ArtifactStagingDirectory)/**/*.zip'
+        deploymentMethod: 'auto'
